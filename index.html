@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#c8402f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="PDF Editor">
+  <title>PDF Editor</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header id="topbar">
+    <button class="tb-btn" id="btn-home" aria-label="Inicio">
+      <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <div id="doc-title">
+      <span id="doc-name">PDF Editor</span>
+      <span id="doc-meta"></span>
+    </div>
+    <button class="tb-btn" id="btn-undo" aria-label="Deshacer" disabled>
+      <svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/></svg>
+    </button>
+    <button class="tb-btn" id="btn-redo" aria-label="Rehacer" disabled>
+      <svg viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H10a6 6 0 000 12h3"/></svg>
+    </button>
+    <button class="tb-btn primary" id="btn-save">Guardar</button>
+  </header>
+
+  <!-- Pantalla de bienvenida -->
+  <section id="welcome">
+    <div class="welcome-inner">
+      <img src="icons/icon-192.png" alt="" class="welcome-logo">
+      <h1>PDF Editor</h1>
+      <p class="muted">Escribe, firma, resalta y organiza tus PDF. Todo se procesa en tu iPhone: tus archivos no se suben a ningún sitio.</p>
+      <button class="big-btn primary" id="btn-open">Abrir PDF</button>
+      <button class="big-btn" id="btn-merge">Unir varios PDF</button>
+      <button class="big-btn ghost" id="btn-resume" hidden></button>
+      <p class="tiny muted" id="install-hint">Para instalarla: en Safari toca <b>Compartir</b> → <b>Añadir a pantalla de inicio</b>.</p>
+    </div>
+  </section>
+
+  <!-- Visor -->
+  <main id="viewer" hidden>
+    <div id="pages"></div>
+  </main>
+
+  <div id="zoom-ctl" hidden>
+    <button id="btn-zoom-out" aria-label="Alejar">−</button>
+    <button id="btn-zoom-in" aria-label="Acercar">+</button>
+  </div>
+
+  <!-- Barra de selección -->
+  <div id="selbar" hidden>
+    <button data-sel="smaller">A−</button>
+    <button data-sel="bigger">A+</button>
+    <button data-sel="edit" id="sel-edit">Editar</button>
+    <button data-sel="delete" class="danger">Eliminar</button>
+  </div>
+
+  <!-- Opciones de herramienta -->
+  <div id="toolopts" hidden>
+    <div id="swatches"></div>
+    <label id="size-wrap"><span id="size-label">Grosor</span>
+      <input type="range" id="size" min="1" max="20" value="3">
+    </label>
+  </div>
+
+  <!-- Herramientas -->
+  <nav id="toolbar" hidden>
+    <button data-tool="pan" class="active"><svg viewBox="0 0 24 24"><path d="M7 11V6a1.5 1.5 0 013 0v4M10 10V4.5a1.5 1.5 0 013 0V10M13 10V5.5a1.5 1.5 0 013 0V11M16 11V8.5a1.5 1.5 0 013 0V15a6 6 0 01-6 6h-1.5a6 6 0 01-4.9-2.5L4 15a1.5 1.5 0 012.4-1.8L7 14"/></svg><span>Mover</span></button>
+    <button data-tool="select"><svg viewBox="0 0 24 24"><path d="M5 3l14 8-6 1.5L10 19z"/></svg><span>Elegir</span></button>
+    <button data-tool="text"><svg viewBox="0 0 24 24"><path d="M5 6V4h14v2M12 4v16M9 20h6"/></svg><span>Texto</span></button>
+    <button data-tool="pen"><svg viewBox="0 0 24 24"><path d="M4 20l1-4L16 5l3 3L8 19z"/><path d="M14 7l3 3"/></svg><span>Lápiz</span></button>
+    <button data-tool="highlight"><svg viewBox="0 0 24 24"><path d="M9 15l-2 5h6l-1-2"/><path d="M8 14l7-10 4 3-7 10z"/></svg><span>Resaltar</span></button>
+    <button data-tool="sign"><svg viewBox="0 0 24 24"><path d="M3 17c3-6 5-9 6-8s-3 8-1 8 3-5 5-5-1 5 1 5 3-2 4-3"/><path d="M3 21h18"/></svg><span>Firma</span></button>
+    <button data-tool="rect"><svg viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1.5"/></svg><span>Tapar</span></button>
+    <button data-tool="image"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-8 8"/></svg><span>Imagen</span></button>
+    <button data-action="pages"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg><span>Páginas</span></button>
+    <button data-action="form" id="btn-form" hidden><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg><span>Formulario</span></button>
+  </nav>
+
+  <!-- Hoja: texto -->
+  <dialog id="dlg-text" class="sheet">
+    <form method="dialog">
+      <h2>Texto</h2>
+      <textarea id="text-input" rows="4" placeholder="Escribe aquí…"></textarea>
+      <label class="row">Tamaño <input type="range" id="text-size" min="6" max="48" value="14"><output id="text-size-out">14</output></label>
+      <div class="sheet-actions">
+        <button value="cancel" class="btn">Cancelar</button>
+        <button value="ok" class="btn primary">Colocar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Hoja: firma -->
+  <dialog id="dlg-sign" class="sheet">
+    <form method="dialog">
+      <h2>Firma</h2>
+      <div id="saved-sigs"></div>
+      <p class="tiny muted">Dibuja tu firma con el dedo:</p>
+      <canvas id="sig-pad"></canvas>
+      <label class="row tiny"><input type="checkbox" id="sig-remember" checked> Recordar esta firma en este iPhone</label>
+      <div class="sheet-actions">
+        <button value="cancel" class="btn">Cancelar</button>
+        <button type="button" id="sig-clear" class="btn">Borrar</button>
+        <button value="ok" class="btn primary">Usar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Hoja: páginas -->
+  <dialog id="dlg-pages" class="sheet tall">
+    <div class="sheet-head">
+      <h2>Páginas</h2>
+      <button class="btn" id="pages-close">Listo</button>
+    </div>
+    <div class="sheet-tools">
+      <button class="btn" id="pages-add-pdf">+ Añadir PDF</button>
+      <button class="btn" id="pages-add-blank">+ Página en blanco</button>
+    </div>
+    <div id="thumbs"></div>
+  </dialog>
+
+  <!-- Hoja: formulario -->
+  <dialog id="dlg-form" class="sheet tall">
+    <div class="sheet-head">
+      <h2>Formulario</h2>
+      <button class="btn primary" id="form-apply">Aplicar</button>
+    </div>
+    <div id="form-fields"></div>
+    <div class="sheet-actions"><button class="btn" id="form-close">Cerrar</button></div>
+  </dialog>
+
+  <!-- Hoja: exportado -->
+  <dialog id="dlg-export" class="sheet">
+    <h2>PDF listo</h2>
+    <p class="muted" id="export-info"></p>
+    <div class="sheet-actions col">
+      <button class="btn primary" id="export-share">Compartir / Guardar en Archivos</button>
+      <a class="btn" id="export-download" download>Abrir / Descargar</a>
+      <button class="btn" id="export-close">Cerrar</button>
+    </div>
+  </dialog>
+
+  <!-- Hoja: confirmación -->
+  <dialog id="dlg-confirm" class="sheet">
+    <form method="dialog">
+      <p id="confirm-msg"></p>
+      <div class="sheet-actions">
+        <button value="cancel" class="btn">Cancelar</button>
+        <button value="ok" class="btn primary" id="confirm-ok">Aceptar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="busy" hidden><div class="spinner"></div><span id="busy-msg">Procesando…</span></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <input type="file" id="file-pdf" accept="application/pdf,.pdf" hidden>
+  <input type="file" id="file-pdf-multi" accept="application/pdf,.pdf" multiple hidden>
+  <input type="file" id="file-img" accept="image/*" hidden>
+
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
