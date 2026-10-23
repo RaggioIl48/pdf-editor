@@ -39,6 +39,7 @@
       <h1>PDF Editor</h1>
       <p class="muted">Escribe, firma, resalta y organiza tus PDF. Todo se procesa en tu iPhone: tus archivos no se suben a ningún sitio.</p>
       <button class="big-btn primary" id="btn-open">Abrir PDF</button>
+      <button class="big-btn" id="btn-from-images">Crear PDF desde imágenes</button>
       <button class="big-btn" id="btn-merge">Unir varios PDF</button>
       <button class="big-btn ghost" id="btn-resume" hidden></button>
       <p class="tiny muted" id="install-hint">Para instalarla: en Safari toca <b>Compartir</b> → <b>Añadir a pantalla de inicio</b>.</p>
@@ -122,9 +123,57 @@
     </div>
     <div class="sheet-tools">
       <button class="btn" id="pages-add-pdf">+ Añadir PDF</button>
+      <button class="btn" id="pages-add-images">+ Imágenes</button>
       <button class="btn" id="pages-add-blank">+ Página en blanco</button>
     </div>
     <div id="thumbs"></div>
+  </dialog>
+
+  <!-- Hoja: PDF desde imágenes -->
+  <dialog id="dlg-images" class="sheet tall">
+    <div class="sheet-head">
+      <h2 id="img-title">PDF desde imágenes</h2>
+      <button class="btn" id="img-cancel">Cancelar</button>
+    </div>
+    <div class="sheet-tools">
+      <button class="btn" id="img-add-photos">+ Fotos</button>
+      <button class="btn" id="img-add-camera">Cámara</button>
+    </div>
+    <div id="img-list"></div>
+    <div id="img-empty" class="muted tiny">Añade fotos de tu galería o tómalas con la cámara. Luego ordénalas con las flechas.</div>
+    <div class="img-opts">
+      <label>Tamaño
+        <select id="opt-size">
+          <option value="a4">A4</option>
+          <option value="carta">Carta</option>
+          <option value="fit">Igual a la imagen</option>
+        </select>
+      </label>
+      <label>Márgenes
+        <select id="opt-margin">
+          <option value="none">Sin márgenes</option>
+          <option value="small" selected>Pequeños</option>
+          <option value="normal">Normales</option>
+        </select>
+      </label>
+      <label>Filtro
+        <select id="opt-filter">
+          <option value="original">Color original</option>
+          <option value="doc">Documento</option>
+          <option value="bw">Blanco y negro</option>
+        </select>
+      </label>
+      <label>Calidad
+        <select id="opt-quality">
+          <option value="alta">Alta</option>
+          <option value="media" selected>Media</option>
+          <option value="baja">Baja (ligero)</option>
+        </select>
+      </label>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn primary" id="img-create" disabled>Crear PDF</button>
+    </div>
   </dialog>
 
   <!-- Hoja: formulario -->
@@ -159,12 +208,14 @@
     </form>
   </dialog>
 
-  <div id="busy" hidden><div class="spinner"></div><span id="busy-msg">Procesando…</span></div>
+  <dialog id="busy"><div class="spinner"></div><span id="busy-msg">Procesando…</span></dialog>
   <div id="toast" role="status" aria-live="polite"></div>
 
   <input type="file" id="file-pdf" accept="application/pdf,.pdf" hidden>
   <input type="file" id="file-pdf-multi" accept="application/pdf,.pdf" multiple hidden>
   <input type="file" id="file-img" accept="image/*" hidden>
+  <input type="file" id="file-photos" accept="image/*" multiple hidden>
+  <input type="file" id="file-camera" accept="image/*" capture="environment" hidden>
 
   <script src="vendor/pdf-lib.min.js"></script>
   <script type="module" src="app.js"></script>

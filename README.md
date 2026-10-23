@@ -2,7 +2,9 @@
 
 Editor de PDF que funciona en Safari, también sin conexión. Todo se procesa en el teléfono y los archivos no se suben a ningún servidor.
 
-**Funciones:** escribir texto, lápiz, resaltar, firma (con firmas guardadas), tapar zonas, insertar imágenes y fotos, rellenar formularios, girar, reordenar y borrar páginas, unir varios PDF, añadir páginas en blanco, deshacer y rehacer. Si Safari cierra la app, el trabajo se recupera con «Continuar con…».
+**Crear PDF desde imágenes:** elige fotos de la galería o tómalas con la cámara, ordénalas y gíralas, y elige el tamaño de página (A4, Carta o igual a la imagen), los márgenes, un filtro de escáner (documento en gris nítido o blanco y negro) y la calidad. El PDF se abre en el editor para seguir trabajando. Desde «Páginas → + Imágenes» también puedes añadir fotos a un PDF que ya tengas abierto.
+
+**Funciones de edición:** escribir texto, lápiz, resaltar, firma (con firmas guardadas), tapar zonas, insertar imágenes y fotos, rellenar formularios, girar, reordenar y borrar páginas, unir varios PDF, añadir páginas en blanco, deshacer y rehacer. Si Safari cierra la app, el trabajo se recupera con «Continuar con…».
 
 ## Publicarla
 

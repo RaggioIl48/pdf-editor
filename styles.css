@@ -187,6 +187,22 @@ textarea, input[type=text], select {
 .thumb .t-actions svg { width: 18px; height: 18px; }
 .thumb .t-actions .danger { color: var(--danger); }
 
+#img-list { flex: 1; overflow: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; align-content: start; padding: 4px 2px 12px; }
+#img-list:empty { display: none; }
+#img-empty { flex: 1; padding: 24px 8px; text-align: center; }
+.img-card { background: var(--surface-2); border-radius: 12px; padding: 8px; display: flex; flex-direction: column; gap: 6px; align-items: center; }
+.img-card .frame { width: 100%; aspect-ratio: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.img-card img { max-width: 100%; max-height: 100%; box-shadow: var(--shadow); transition: transform .2s; }
+.img-card .t-num { font-size: 12px; color: var(--muted); }
+.img-card .t-actions { display: flex; gap: 4px; }
+.img-card .t-actions button { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+.img-card .t-actions svg { width: 18px; height: 18px; }
+.img-card .t-actions .danger { color: var(--danger); }
+.img-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.img-opts label { font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.img-opts select { padding: 8px; font-size: 15px; }
+#img-create:disabled { opacity: .4; }
+
 #form-fields { flex: 1; overflow: auto; }
 .field { margin-bottom: 14px; }
 .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; word-break: break-word; }
@@ -194,10 +210,13 @@ textarea, input[type=text], select {
 .field .check input { width: 22px; height: 22px; }
 .form-src { font-weight: 600; margin: 8px 0; }
 
+/* Es un <dialog> modal para quedar por encima de cualquier hoja abierta. */
 #busy {
-  position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.35);
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: #fff; font-weight: 600;
+  border: 0; background: transparent; padding: 0; margin: auto;
+  flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: #fff; font-weight: 600;
 }
+#busy[open] { display: flex; }
+#busy::backdrop { background: rgba(0,0,0,.45); }
 .spinner { width: 40px; height: 40px; border-radius: 50%; border: 4px solid rgba(255,255,255,.3); border-top-color: #fff; animation: spin 0.9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

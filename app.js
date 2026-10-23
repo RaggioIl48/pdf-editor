@@ -52,9 +52,15 @@ function toast(msg, ms = 2600) {
   toastTimer = setTimeout(() => t.classList.remove('show'), ms);
 }
 function busy(msg) {
-  $('#busy').hidden = !msg;
-  if (msg) $('#busy-msg').textContent = msg;
+  const d = $('#busy');
+  if (msg) {
+    $('#busy-msg').textContent = msg;
+    if (!d.open) d.showModal();
+  } else if (d.open) {
+    d.close();
+  }
 }
+$('#busy').addEventListener('cancel', (e) => e.preventDefault()); // no se cierra con Escape
 function confirmDlg(msg, okLabel = 'Aceptar') {
   const d = $('#dlg-confirm');
   $('#confirm-msg').textContent = msg;
@@ -1075,6 +1081,211 @@ $('#pages-close').addEventListener('click', () => $('#dlg-pages').close());
 $('#dlg-pages').addEventListener('close', () => { if (pagesDirty) layout(); });
 $('#pages-add-pdf').addEventListener('click', () => { pickAppend = true; $('#file-pdf-multi').click(); });
 $('#pages-add-blank').addEventListener('click', async () => { await addBlankPage(); pagesDirty = false; renderThumbs(); });
+
+/* ---------------- PDF desde imágenes ---------------- */
+
+const imgJob = { items: [], append: false }; // items: { id, file, url, rot }
+const PAGE_SIZES = { a4: [595.28, 841.89], carta: [612, 792] };
+const MARGINS = { none: 0, small: 18, normal: 36 };
+const QUALITY = { alta: [2400, 0.9], media: [1700, 0.8], baja: [1200, 0.65] };
+const IMG_PREFS_KEY = 'pdf-editor.image-options';
+
+function openImagesDialog(append) {
+  imgJob.append = append;
+  clearImageItems();
+  try {
+    const saved = JSON.parse(localStorage.getItem(IMG_PREFS_KEY)) || {};
+    for (const k of ['size', 'margin', 'filter', 'quality']) if (saved[k]) $('#opt-' + k).value = saved[k];
+  } catch { /* sin preferencias guardadas */ }
+  $('#img-title').textContent = append ? 'Añadir imágenes' : 'PDF desde imágenes';
+  $('#img-create').textContent = append ? 'Añadir páginas' : 'Crear PDF';
+  renderImageItems();
+  $('#dlg-images').showModal();
+}
+function clearImageItems() {
+  imgJob.items.forEach((it) => URL.revokeObjectURL(it.url));
+  imgJob.items = [];
+}
+function addImageFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith('image/') && !/\.(heic|heif|jpe?g|png|webp|gif)$/i.test(f.name)) continue;
+    imgJob.items.push({ id: newId('i'), file: f, url: URL.createObjectURL(f), rot: 0 });
+  }
+  renderImageItems();
+}
+
+function renderImageItems() {
+  const box = $('#img-list');
+  box.textContent = '';
+  const n = imgJob.items.length;
+  imgJob.items.forEach((it, i) => {
+    const card = document.createElement('div');
+    card.className = 'img-card';
+    const frame = document.createElement('div');
+    frame.className = 'frame';
+    const img = document.createElement('img');
+    img.src = it.url;
+    img.alt = `Imagen ${i + 1}`;
+    img.style.transform = `rotate(${it.rot}deg)`;
+    frame.append(img);
+    const num = document.createElement('div');
+    num.className = 't-num';
+    num.textContent = `Página ${i + 1}`;
+    const acts = document.createElement('div');
+    acts.className = 't-actions';
+    const mk = (icon, label, fn, disabled = false, cls = '') => {
+      const b = document.createElement('button');
+      b.innerHTML = ICON[icon];
+      b.setAttribute('aria-label', label);
+      b.disabled = disabled;
+      if (cls) b.className = cls;
+      b.onclick = fn;
+      acts.append(b);
+    };
+    const move = (d) => { const [x] = imgJob.items.splice(i, 1); imgJob.items.splice(i + d, 0, x); renderImageItems(); };
+    mk('up', 'Mover antes', () => move(-1), i === 0);
+    mk('rotate', 'Girar', () => { it.rot = (it.rot + 90) % 360; img.style.transform = `rotate(${it.rot}deg)`; });
+    mk('down', 'Mover después', () => move(1), i === n - 1);
+    mk('del', 'Quitar imagen', () => { URL.revokeObjectURL(it.url); imgJob.items.splice(i, 1); renderImageItems(); }, false, 'danger');
+    card.append(frame, num, acts);
+    box.append(card);
+  });
+  $('#img-empty').hidden = n > 0;
+  $('#img-create').disabled = n === 0;
+  if (n) $('#img-create').textContent = (imgJob.append ? 'Añadir ' : 'Crear PDF · ') + n + (n === 1 ? ' página' : ' páginas');
+}
+
+// Filtro de escáner: estima el color del papel por zonas (para quitar sombras y luz irregular),
+// lo convierte en blanco y luego aplica niveles automáticos para que el texto quede oscuro.
+function applyScanFilter(ctx, w, h, mode) {
+  const data = ctx.getImageData(0, 0, w, h);
+  const px = data.data;
+  const gray = new Float32Array(w * h);
+  for (let i = 0, j = 0; j < gray.length; i += 4, j++) gray[j] = (px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) / 1000;
+
+  // Fondo: en cada bloque, la celda de 4x4 más clara representa el papel.
+  const B = Math.max(24, Math.round(Math.max(w, h) / 40));
+  const bw = Math.ceil(w / B), bh = Math.ceil(h / B);
+  const bg = new Float32Array(bw * bh);
+  for (let by = 0; by < bh; by++) {
+    for (let bx = 0; bx < bw; bx++) {
+      let best = 0;
+      for (let cy = by * B; cy < Math.min(h, (by + 1) * B); cy += 4) {
+        for (let cx = bx * B; cx < Math.min(w, (bx + 1) * B); cx += 4) {
+          let s = 0, n = 0;
+          for (let y = cy; y < Math.min(h, cy + 4); y++) for (let x = cx; x < Math.min(w, cx + 4); x++) { s += gray[y * w + x]; n++; }
+          if (s / n > best) best = s / n;
+        }
+      }
+      bg[by * bw + bx] = Math.max(best, 40);
+    }
+  }
+  const bgAt = (x, y) => { // interpolación bilineal entre centros de bloque
+    const fx = Math.min(bw - 1, Math.max(0, x / B - 0.5)), fy = Math.min(bh - 1, Math.max(0, y / B - 0.5));
+    const x0 = Math.floor(fx), y0 = Math.floor(fy), x1 = Math.min(bw - 1, x0 + 1), y1 = Math.min(bh - 1, y0 + 1);
+    const tx = fx - x0, ty = fy - y0;
+    const top = bg[y0 * bw + x0] * (1 - tx) + bg[y0 * bw + x1] * tx;
+    const bot = bg[y1 * bw + x0] * (1 - tx) + bg[y1 * bw + x1] * tx;
+    return top * (1 - ty) + bot * ty;
+  };
+  const hist = new Uint32Array(256);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const j = y * w + x;
+      const g = Math.min(255, (gray[j] / bgAt(x, y)) * 255);
+      px[j * 4] = g;
+      hist[g | 0]++;
+    }
+  }
+  const total = w * h;
+  const pct = (p) => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= total * p) return v; } return 255; };
+  const lo = pct(0.02), hi = Math.max(lo + 30, pct(0.85));
+  for (let i = 0; i < px.length; i += 4) {
+    let v = ((px[i] - lo) / (hi - lo)) * 255;
+    if (mode === 'bw') v = v < 150 ? 0 : 255;
+    else v = Math.max(0, Math.min(255, v));
+    px[i] = px[i + 1] = px[i + 2] = v;
+  }
+  ctx.putImageData(data, 0, 0);
+}
+
+async function processImage(it, opts) {
+  const img = await loadImage(it.url);
+  const [maxSide, q] = QUALITY[opts.quality];
+  const k = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.round(img.naturalWidth * k), h = Math.round(img.naturalHeight * k);
+  const swap = it.rot % 180 !== 0;
+  const c = document.createElement('canvas');
+  c.width = swap ? h : w;
+  c.height = swap ? w : h;
+  const ctx = c.getContext('2d', { willReadFrequently: opts.filter !== 'original' });
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.translate(c.width / 2, c.height / 2);
+  ctx.rotate((it.rot * Math.PI) / 180);
+  ctx.drawImage(img, -w / 2, -h / 2, w, h);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (opts.filter !== 'original') applyScanFilter(ctx, c.width, c.height, opts.filter);
+  const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', q));
+  const out = { bytes: new Uint8Array(await blob.arrayBuffer()), w: c.width, h: c.height };
+  c.width = c.height = 0;
+  return out;
+}
+
+async function imagesToPdf(opts) {
+  const doc = await PDFDocument.create();
+  const m = MARGINS[opts.margin];
+  const n = imgJob.items.length;
+  for (let i = 0; i < n; i++) {
+    busy(`Procesando imagen ${i + 1} de ${n}…`);
+    const { bytes, w, h } = await processImage(imgJob.items[i], opts);
+    const jpg = await doc.embedJpg(bytes);
+    let pw, ph, dw, dh;
+    if (opts.size === 'fit') {
+      const s = 842 / Math.max(w, h); // lado largo como un A4, para que se vea a buen tamaño
+      dw = w * s; dh = h * s; pw = dw + 2 * m; ph = dh + 2 * m;
+    } else {
+      [pw, ph] = PAGE_SIZES[opts.size];
+      if (w > h) [pw, ph] = [ph, pw]; // orientación automática
+      const s = Math.min((pw - 2 * m) / w, (ph - 2 * m) / h);
+      dw = w * s; dh = h * s;
+    }
+    const page = doc.addPage([pw, ph]);
+    page.drawImage(jpg, { x: (pw - dw) / 2, y: (ph - dh) / 2, width: dw, height: dh });
+  }
+  return doc.save();
+}
+
+$('#img-create').addEventListener('click', async () => {
+  if (!imgJob.items.length || $('#busy').open) return;
+  const opts = Object.fromEntries(['size', 'margin', 'filter', 'quality'].map((k) => [k, $('#opt-' + k).value]));
+  try { localStorage.setItem(IMG_PREFS_KEY, JSON.stringify(opts)); } catch { /* sin almacenamiento */ }
+  let bytes;
+  try {
+    bytes = await imagesToPdf(opts);
+  } catch (e) {
+    console.error(e);
+    busy(null);
+    toast('No se pudo leer alguna imagen. Prueba a quitarla.', 4000);
+    return;
+  }
+  busy(null);
+  const d = new Date();
+  const name = `Imágenes ${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}.pdf`;
+  const append = imgJob.append;
+  $('#dlg-images').close();
+  clearImageItems();
+  await openFiles([new File([bytes], name, { type: 'application/pdf' })], { append });
+  if (append && $('#dlg-pages').open) { pagesDirty = false; renderThumbs(); }
+});
+$('#img-cancel').addEventListener('click', () => { $('#dlg-images').close(); clearImageItems(); });
+$('#img-add-photos').addEventListener('click', () => $('#file-photos').click());
+$('#img-add-camera').addEventListener('click', () => $('#file-camera').click());
+for (const id of ['#file-photos', '#file-camera']) {
+  $(id).addEventListener('change', (e) => { const f = [...e.target.files]; e.target.value = ''; addImageFiles(f); });
+}
+$('#btn-from-images').addEventListener('click', () => openImagesDialog(false));
+$('#pages-add-images').addEventListener('click', () => openImagesDialog(true));
 
 /* ---------------- Formulario ---------------- */
 
