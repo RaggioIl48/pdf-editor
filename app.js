@@ -450,6 +450,7 @@ async function renderPage(v) {
     renderedOrder = renderedOrder.filter((id) => id !== v.page.id);
     renderedOrder.push(v.page.id);
     drawInk(v);
+    if (state.tool === 'edittext') getRuns(v.page).then(() => drawInk(v));
     evictPages();
   } catch (e) {
     if (e?.name !== 'RenderingCancelledException') console.error(e);
@@ -466,6 +467,195 @@ function rerenderSource(srcId) {
     if (visible.has(v.page.id)) renderPage(v);
   }
   for (const k of [...thumbCache.keys()]) if (k.startsWith(srcId + '#')) thumbCache.delete(k);
+  for (const k of [...runCache.keys()]) if (k.startsWith(srcId + '#')) { runCache.delete(k); runSync.delete(k); }
+}
+
+/* ---------------- Texto existente del PDF ---------------- */
+
+// pdf.js entrega el texto en trozos; se unen en líneas ("runs") con la misma fuente y tamaño.
+const runCache = new Map(); // `${src}#${index}` -> Promise<runs>
+const runSync = new Map();  // lo mismo ya resuelto, para responder dentro del toque (teclado de iOS)
+const runKeyOf = (p) => `${p.src}#${p.index}`;
+
+function buildRuns(tc) {
+  const runs = [];
+  let cur = null;
+  for (const it of tc.items) {
+    if (!it.str) { if (it.hasEOL) cur = null; continue; }
+    const [a, b, c, d, e, f] = it.transform;
+    const size = Math.hypot(c, d) || Math.hypot(a, b);
+    const style = tc.styles[it.fontName] || {};
+    if (size < 1 || style.vertical) { cur = null; continue; }
+    const ang = Math.atan2(b, a);
+    const rot = Math.round((ang * 180) / Math.PI * 10) / 10;
+    if (cur && cur.fontName === it.fontName && Math.abs(cur.rot - rot) < 1 && Math.abs(cur.size - size) < cur.size * 0.15) {
+      const t = (cur.rot * Math.PI) / 180, dx = e - cur.x, dy = f - cur.y;
+      const along = dx * Math.cos(t) + dy * Math.sin(t), perp = -dx * Math.sin(t) + dy * Math.cos(t);
+      if (Math.abs(perp) < size * 0.35 && along > cur.w - size * 0.6 && along < cur.w + size * 1.2) {
+        if (along - cur.w > size * 0.18 && !cur.text.endsWith(' ') && !it.str.startsWith(' ')) cur.text += ' ';
+        cur.text += it.str;
+        cur.w = Math.max(cur.w, along + it.width);
+        if (it.hasEOL) cur = null;
+        continue;
+      }
+    }
+    cur = {
+      id: runs.length, x: e, y: f, rot, size, w: it.width, text: it.str, fontName: it.fontName,
+      asc: Math.min(0.88, Math.max(0.78, style.ascent || 0.8)), // al menos 0.78 para tapar las tildes de las mayúsculas
+      desc: Math.min(-0.1, Math.max(-0.35, style.descent || -0.2)),
+    };
+    runs.push(cur);
+    if (it.hasEOL) cur = null;
+  }
+  return runs.filter((r) => r.text.trim()).map((r) => ({ ...r, text: r.text.replace(/\s+$/, '') }));
+}
+
+function getRuns(p) {
+  const key = runKeyOf(p);
+  if (!runCache.has(key)) {
+    runCache.set(key, (async () => {
+      const proxy = await state.sources.get(p.src).doc.getPage(p.index + 1);
+      const runs = buildRuns(await proxy.getTextContent());
+      runSync.set(key, runs);
+      return runs;
+    })().catch(() => { runSync.set(key, []); return []; }));
+  }
+  return runCache.get(key);
+}
+
+function runLocalBox(r, pad = 0) {
+  return { x0: -pad, x1: r.w + pad, y0: r.desc * r.size - pad, y1: r.asc * r.size + pad };
+}
+function runCorners(r, pad = 0) {
+  const b = runLocalBox(r, pad);
+  return [[b.x0, b.y0], [b.x1, b.y0], [b.x1, b.y1], [b.x0, b.y1]].map(([x, y]) => {
+    const [rx, ry] = rotVec(x, y, r.rot);
+    return [r.x + rx, r.y + ry];
+  });
+}
+function hitRun(r, pt, pad) {
+  const t = (r.rot * Math.PI) / 180, dx = pt[0] - r.x, dy = pt[1] - r.y;
+  const along = dx * Math.cos(t) + dy * Math.sin(t), perp = -dx * Math.sin(t) + dy * Math.cos(t);
+  const b = runLocalBox(r, pad);
+  return along >= b.x0 && along <= b.x1 && perp >= b.y0 && perp <= b.y1;
+}
+
+function drawRunOutlines(ctx, v) {
+  const runs = runSync.get(runKeyOf(v.page));
+  if (!runs) return;
+  const done = new Set(v.page.annots.map((a) => a.runKey).filter(Boolean));
+  ctx.save();
+  ctx.lineWidth = 0.8 / v.scale;
+  ctx.strokeStyle = 'rgba(31,79,209,.6)';
+  ctx.fillStyle = 'rgba(31,79,209,.07)';
+  for (const r of runs) {
+    if (done.has(runKeyOf(v.page) + '#' + r.id)) continue;
+    const c = runCorners(r, 0.6);
+    ctx.beginPath();
+    c.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// Toma de la página ya dibujada el color del fondo (mediana del borde) y el del texto (el píxel más distinto).
+function sampleRunColors(v, r) {
+  const c = v.pdfCanvas;
+  const fallback = { fg: '#000000', bg: '#ffffff' };
+  if (!c.width) return fallback;
+  const k = c.width / v.vp.width, m = v.vp.transform;
+  const pts = runCorners(r, 1.5).map(([x, y]) => [(x * m[0] + y * m[2] + m[4]) * k, (x * m[1] + y * m[3] + m[5]) * k]);
+  const x0 = Math.max(0, Math.floor(Math.min(...pts.map((p) => p[0]))));
+  const y0 = Math.max(0, Math.floor(Math.min(...pts.map((p) => p[1]))));
+  const x1 = Math.min(c.width, Math.ceil(Math.max(...pts.map((p) => p[0]))));
+  const y1 = Math.min(c.height, Math.ceil(Math.max(...pts.map((p) => p[1]))));
+  const w = x1 - x0, h = y1 - y0;
+  if (w < 2 || h < 2) return fallback;
+  const d = c.getContext('2d').getImageData(x0, y0, w, h).data;
+  for (let i = 0; i < d.length; i += 4) { // lo transparente se ve blanco (el papel), no negro
+    const al = d[i + 3] / 255;
+    for (let j = 0; j < 3; j++) d[i + j] = d[i + j] * al + 255 * (1 - al);
+  }
+  const border = [[], [], []];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (x > 0 && x < w - 1 && y > 0 && y < h - 1) continue;
+      const i = (y * w + x) * 4;
+      border[0].push(d[i]); border[1].push(d[i + 1]); border[2].push(d[i + 2]);
+    }
+  }
+  const bg = border.map((ch) => ch.sort((p, q) => p - q)[ch.length >> 1]);
+  let best = -1, fg = [0, 0, 0];
+  for (let i = 0; i < d.length; i += 4) {
+    const dist = Math.abs(d[i] - bg[0]) + Math.abs(d[i + 1] - bg[1]) + Math.abs(d[i + 2] - bg[2]);
+    if (dist > best) { best = dist; fg = [d[i], d[i + 1], d[i + 2]]; }
+  }
+  const hex = (rgbArr) => '#' + rgbArr.map((n) => n.toString(16).padStart(2, '0')).join('');
+  return { fg: best > 60 ? hex(fg) : '#000000', bg: hex(bg) };
+}
+
+// Fuente estándar más parecida a la original, según su nombre interno.
+async function runFont(p, r) {
+  let name = '', bold = false, italic = false, family = '';
+  try {
+    const proxy = await state.sources.get(p.src).doc.getPage(p.index + 1);
+    if (proxy.commonObjs.has(r.fontName)) {
+      const f = proxy.commonObjs.get(r.fontName);
+      name = f.name || '';
+      bold = !!(f.bold || f.black);
+      italic = !!f.italic;
+      family = f.fallbackName || '';
+    }
+  } catch { /* fuente no disponible: se usa Helvetica */ }
+  const n = name.toLowerCase();
+  if (/bold|black|heavy|semibold|demi/.test(n)) bold = true;
+  if (/italic|oblique/.test(n)) italic = true;
+  let font = 'helv';
+  if (/courier|mono|consol/.test(n) || family === 'monospace') font = 'courier';
+  else if ((/times|georgia|garamond|cambria|minion|serif|roman|book/.test(n) && !/sans/.test(n)) || family === 'serif') font = 'times';
+  return { font, bold, italic };
+}
+
+function editTextAt(v, pt) {
+  const proceed = (runs) => {
+    if (!runs.length) {
+      toast('Esta página no tiene texto editable (parece una foto o un escaneo). Usa «Tapar» y luego «Texto».', 5000);
+      return;
+    }
+    const r = runs.find((x) => hitRun(x, pt, 2 / v.scale + 0.5));
+    if (!r) { toast('Toca justo encima de una de las líneas marcadas en azul.'); return; }
+    const key = runKeyOf(v.page) + '#' + r.id;
+    const existing = v.page.annots.find((a) => a.runKey === key);
+    if (existing) openTextDialog(existing, v);
+    else openTextDialog(null, v, pt, r);
+  };
+  const ready = runSync.get(runKeyOf(v.page));
+  if (ready) proceed(ready); else getRuns(v.page).then(proceed);
+}
+
+async function replaceRun(v, r, text, size) {
+  const { fg, bg } = sampleRunColors(v, r);
+  const { font, bold, italic } = await runFont(v.page, r);
+  const b = runLocalBox(r, 0.6);
+  const [cx, cy] = rotVec(b.x0, b.y0, r.rot);
+  const a = {
+    id: newId('a'), type: 'text', x: r.x, y: r.y, rot: r.rot, size, text, color: fg, font, bold, italic,
+    cover: { x: r.x + cx, y: r.y + cy, rot: r.rot, w: b.x1 - b.x0, h: b.y1 - b.y0, color: bg },
+    runKey: runKeyOf(v.page) + '#' + r.id,
+  };
+  a.w = measureText(a);
+  pushUndo();
+  v.page.annots.push(a);
+  drawInk(v);
+  saveMeta();
+}
+
+function prefetchRuns() {
+  for (const v of views.values()) {
+    if (v.rendered) getRuns(v.page).then(() => drawInk(v));
+  }
 }
 
 /* ---------------- Dibujo de anotaciones ---------------- */
@@ -484,10 +674,24 @@ function getImg(src, onReady) {
 }
 
 const measureCtx = document.createElement('canvas').getContext('2d');
-const FONT_STACK = 'Helvetica, Arial, sans-serif';
+// Familias equivalentes en pantalla a las fuentes estándar del PDF (Helvetica, Times, Courier).
+const FONT_FAMILIES = {
+  helv: 'Helvetica, Arial, sans-serif',
+  times: '"Times New Roman", Times, serif',
+  courier: '"Courier New", Courier, monospace',
+};
+const fontCss = (a) => `${a.italic ? 'italic ' : ''}${a.bold ? 'bold ' : ''}${a.size}px ${FONT_FAMILIES[a.font || 'helv']}`;
 function measureText(a) {
-  measureCtx.font = `${a.size}px ${FONT_STACK}`;
+  measureCtx.font = fontCss(a);
   return Math.max(4, ...a.text.split('\n').map((l) => measureCtx.measureText(l).width));
+}
+function drawCover(ctx, c) {
+  ctx.save();
+  ctx.translate(c.x, c.y);
+  ctx.rotate((c.rot * Math.PI) / 180);
+  ctx.fillStyle = c.color;
+  ctx.fillRect(0, 0, c.w, c.h);
+  ctx.restore();
 }
 
 function drawAnnot(ctx, a, redraw) {
@@ -512,11 +716,12 @@ function drawAnnot(ctx, a, redraw) {
       ctx.strokeRect(a.x, a.y, a.w, a.h);
     }
   } else if (a.type === 'text') {
+    if (a.cover) drawCover(ctx, a.cover); // texto original reemplazado: se tapa con el color del fondo
     ctx.translate(a.x, a.y);
     ctx.rotate((a.rot * Math.PI) / 180);
     ctx.scale(1, -1);
     ctx.fillStyle = a.color;
-    ctx.font = `${a.size}px ${FONT_STACK}`;
+    ctx.font = fontCss(a);
     ctx.textBaseline = 'alphabetic';
     a.text.split('\n').forEach((l, i) => ctx.fillText(l, 0, i * a.size * LINE_H));
   } else if (a.type === 'image') {
@@ -569,6 +774,7 @@ function drawInk(v) {
   const redraw = () => drawInk(v);
   for (const a of v.page.annots) drawAnnot(ctx, a, redraw);
   if (tempAnnot && tempAnnot.pageId === v.page.id) drawAnnot(ctx, tempAnnot.annot, redraw);
+  if (state.tool === 'edittext') drawRunOutlines(ctx, v);
   if (state.selected && state.selected.pageId === v.page.id && state.tool === 'select') {
     const a = v.page.annots.find((x) => x.id === state.selected.annotId);
     if (a) {
@@ -696,6 +902,8 @@ function onTap(v, pt) {
     updateSelbar();
   } else if (t === 'text') {
     openTextDialog(null, v, pt);
+  } else if (t === 'edittext') {
+    editTextAt(v, pt);
   } else if ((t === 'sign' || t === 'image') && state.pendingImage) {
     placeImage(v, pt);
   } else if (t === 'sign') {
@@ -814,6 +1022,7 @@ $('#toolbar').addEventListener('click', (e) => {
   const t = b.dataset.tool;
   setTool(t);
   if (t === 'text') toast('Toca la página donde quieres escribir.');
+  if (t === 'edittext') { prefetchRuns(); toast('Toca una línea marcada en azul para cambiar su texto.'); }
   if (t === 'sign') openSignDialog();
   if (t === 'image') $('#file-img').click();
   if (t === 'rect') toast('Arrastra sobre la zona que quieres tapar.');
@@ -823,13 +1032,21 @@ $('#toolbar').addEventListener('click', (e) => {
 /* ---------------- Texto ---------------- */
 
 let textCtx = null;
-function openTextDialog(annot, v, pt) {
-  textCtx = { annot, v, pt };
+// run: línea de texto original del PDF que se va a reemplazar (herramienta «Editar»).
+function openTextDialog(annot, v, pt, run = null) {
+  const replacing = !!(run || annot?.cover);
   const d = $('#dlg-text');
-  $('#text-input').value = annot ? annot.text : '';
-  const size = annot ? Math.round(annot.size) : prefs.text.size;
-  $('#text-size').value = size;
-  $('#text-size-out').textContent = size;
+  $('#text-title').textContent = replacing ? 'Cambiar texto del PDF' : 'Texto';
+  $('#text-ok').textContent = annot || run ? 'Cambiar' : 'Colocar';
+  $('#text-hint').hidden = !replacing;
+  $('#text-input').value = annot ? annot.text : run ? run.text : '';
+  const exact = annot ? annot.size : run ? run.size : prefs.text.size;
+  const slider = $('#text-size');
+  slider.min = Math.min(6, Math.floor(exact));
+  slider.max = Math.max(48, Math.ceil(exact));
+  slider.value = exact;
+  $('#text-size-out').textContent = Math.round(+slider.value * 10) / 10;
+  textCtx = { annot, v, pt, run, exact, sliderStart: slider.value };
   d.returnValue = '';
   d.showModal();
   $('#text-input').focus(); // en iOS el teclado solo se abre si el foco ocurre dentro del toque
@@ -837,12 +1054,18 @@ function openTextDialog(annot, v, pt) {
 $('#text-size').addEventListener('input', (e) => { $('#text-size-out').textContent = e.target.value; });
 $('#dlg-text').addEventListener('close', () => {
   const d = $('#dlg-text');
-  const { annot, v, pt } = textCtx || {};
+  const { annot, v, pt, run, exact, sliderStart } = textCtx || {};
   textCtx = null;
   const text = $('#text-input').value.replace(/\s+$/, '');
-  if (d.returnValue !== 'ok' || !text || !v) return;
-  const size = +$('#text-size').value;
-  prefs.text.size = size;
+  const replacing = !!(run || annot?.cover);
+  if (d.returnValue !== 'ok' || !v || (!text && !replacing)) return;
+  // si no se tocó el tamaño se conserva el original exacto (p. ej. 9,96 pt)
+  const size = $('#text-size').value === sliderStart ? exact : +$('#text-size').value;
+  if (run) {
+    if (text !== run.text || size !== exact) replaceRun(v, run, text, size);
+    return;
+  }
+  if (!replacing) prefs.text.size = size;
   pushUndo();
   if (annot) {
     annot.text = text; annot.size = size; annot.w = measureText(annot);
@@ -1412,7 +1635,17 @@ async function rasterPage(out, src, p) {
 
 async function buildPdf() {
   const out = await PDFDocument.create();
-  const font = await out.embedFont(StandardFonts.Helvetica);
+  const STD = {
+    helv: 'Helvetica', helvB: 'HelveticaBold', helvI: 'HelveticaOblique', helvBI: 'HelveticaBoldOblique',
+    times: 'TimesRoman', timesB: 'TimesRomanBold', timesI: 'TimesRomanItalic', timesBI: 'TimesRomanBoldItalic',
+    courier: 'Courier', courierB: 'CourierBold', courierI: 'CourierOblique', courierBI: 'CourierBoldOblique',
+  };
+  const fonts = new Map();
+  const fontFor = async (a) => {
+    const key = (a.font || 'helv') + (a.bold ? 'B' : '') + (a.italic ? 'I' : '');
+    if (!fonts.has(key)) fonts.set(key, await out.embedFont(StandardFonts[STD[key]]));
+    return fonts.get(key);
+  };
   const libs = new Map();
   let rastered = 0;
   for (const id of new Set(state.pages.map((p) => p.src))) {
@@ -1464,6 +1697,11 @@ async function buildPdf() {
       } else if (a.type === 'rect') {
         pg.drawRectangle({ x: a.x + offX, y: a.y + offY, width: a.w, height: a.h, color: hexToRgb(a.color) });
       } else if (a.type === 'text') {
+        if (a.cover) {
+          const c = a.cover;
+          pg.drawRectangle({ x: c.x + offX, y: c.y + offY, width: c.w, height: c.h, rotate: degrees(c.rot), color: hexToRgb(c.color) });
+        }
+        const font = await fontFor(a);
         const lh = a.size * LINE_H;
         a.text.split('\n').forEach((line, i) => {
           if (!line) return;
@@ -1519,6 +1757,25 @@ let pickAppend = false;
 $('#btn-open').addEventListener('click', () => $('#file-pdf').click());
 $('#btn-merge').addEventListener('click', () => { pickAppend = false; $('#file-pdf-multi').click(); });
 $('#btn-resume').addEventListener('click', resumeSession);
+$('#btn-share-app').addEventListener('click', async () => {
+  const url = new URL('./', location.href).href;
+  const data = {
+    title: 'PDF Editor',
+    text: 'Editor de PDF gratis: firma, edita texto y crea PDF con fotos. Funciona en el navegador y tus archivos no se suben a ningún sitio.',
+    url,
+  };
+  try {
+    if (navigator.share) { await navigator.share(data); return; }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('Enlace copiado: ' + url, 4000);
+  } catch {
+    toast(url, 6000);
+  }
+});
 $('#file-pdf').addEventListener('change', (e) => { const f = [...e.target.files]; e.target.value = ''; openFiles(f); });
 $('#file-pdf-multi').addEventListener('change', (e) => {
   const f = [...e.target.files]; e.target.value = '';
