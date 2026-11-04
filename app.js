@@ -207,12 +207,9 @@ async function addSource(bytes, name, id = newId('s')) {
 }
 
 async function pagesFromSource(src) {
-  const list = [];
-  for (let i = 0; i < src.doc.numPages; i++) {
-    const pg = await src.doc.getPage(i + 1);
-    list.push({ id: newId('p'), src: src.id, index: i, base: pg.rotate || 0, rot: 0, view: pg.view.slice(), annots: [] });
-  }
-  return list;
+  // Se piden todas las páginas a la vez: en PDF largos abrir es mucho más rápido que de una en una.
+  const pgs = await Promise.all(Array.from({ length: src.doc.numPages }, (_, i) => src.doc.getPage(i + 1)));
+  return pgs.map((pg, i) => ({ id: newId('p'), src: src.id, index: i, base: pg.rotate || 0, rot: 0, view: pg.view.slice(), annots: [] }));
 }
 
 async function readFile(file) {
@@ -285,6 +282,15 @@ async function resumeSession() {
       if (rec) await addSource(rec.bytes, rec.name, rec.id);
     }
     state.pages = meta.pages.filter((p) => state.sources.has(p.src));
+    // Reemplazos guardados por la versión anterior (por líneas): su recuadro pasa a ser la zona tapada fija.
+    for (const p of state.pages) {
+      for (const a of p.annots) {
+        if (a.type === 'text' && a.cover && a.runKey && !a.coverBase) {
+          a.coverBase = { ox: a.cover.x, oy: a.cover.y, x0: 0, y0: 0, x1: a.cover.w, y1: a.cover.h };
+          a.coverColor = a.cover.color;
+        }
+      }
+    }
     state.name = meta.name;
     showEditor();
     layout();
@@ -476,6 +482,7 @@ function rerenderSource(srcId) {
 const runCache = new Map(); // `${src}#${index}` -> Promise<runs>
 const runSync = new Map();  // lo mismo ya resuelto, para responder dentro del toque (teclado de iOS)
 const runKeyOf = (p) => `${p.src}#${p.index}`;
+const blockKey = (p, r) => `${runKeyOf(p)}#b${r.id}`;
 
 function buildRuns(tc) {
   const runs = [];
@@ -510,12 +517,95 @@ function buildRuns(tc) {
   return runs.filter((r) => r.text.trim()).map((r) => ({ ...r, text: r.text.replace(/\s+$/, '') }));
 }
 
+// Coordenadas en el marco del texto girado: u = a lo largo de la línea, v = perpendicular (hacia arriba).
+const toFrame = (x, y, rot) => rotVec(x, y, -rot);
+
+// Une los trozos en líneas (misma línea base, aunque cambie la fuente) y las líneas en párrafos:
+// mismo tamaño, interlineado parecido y columnas que se solapan. Así se edita un párrafo entero.
+function buildBlocks(runs) {
+  const items = runs.map((r) => { const [u, v] = toFrame(r.x, r.y, r.rot); return { r, u0: u, u1: u + r.w, v }; });
+  items.sort((a, b) => a.r.rot - b.r.rot || b.v - a.v);
+  const groups = [];
+  for (const it of items) {
+    const g = groups[groups.length - 1];
+    if (g && Math.abs(g.rot - it.r.rot) < 1 && Math.abs(g.v - it.v) < g.size * 0.35) g.items.push(it);
+    else groups.push({ rot: it.r.rot, v: it.v, size: it.r.size, items: [it] });
+  }
+  const lines = [];
+  for (const g of groups) {
+    g.items.sort((a, b) => a.u0 - b.u0);
+    let L = null;
+    for (const it of g.items) {
+      if (L && it.u0 - L.u1 < L.size * 1.5) {
+        if (it.u0 - L.u1 > L.size * 0.18 && !L.text.endsWith(' ') && !it.r.text.startsWith(' ')) L.text += ' ';
+        L.text += it.r.text;
+        L.u1 = Math.max(L.u1, it.u1);
+        L.parts.push(it.r);
+      } else {
+        L = { rot: g.rot, v: g.v, u0: it.u0, u1: it.u1, size: it.r.size, text: it.r.text, parts: [it.r] };
+        lines.push(L);
+      }
+    }
+  }
+  lines.sort((a, b) => a.rot - b.rot || b.v - a.v || a.u0 - b.u0);
+  const blocks = [];
+  for (const L of lines) {
+    let target = null;
+    for (let i = blocks.length - 1; i >= Math.max(0, blocks.length - 6) && !target; i--) {
+      const B = blocks[i];
+      const d = B.vLast - L.v;
+      if (Math.abs(B.rot - L.rot) >= 1 || Math.abs(B.size - L.size) > B.size * 0.2) continue;
+      if (d < B.size * 0.85 || d > B.size * 2) continue;
+      if (B.lines.length > 1 && Math.abs(d - B.lead) > B.size * 0.3) continue;
+      if (L.u0 >= B.u1 || L.u1 <= B.u0) continue; // otra columna
+      target = B;
+      if (B.lines.length === 1) B.lead = d;
+    }
+    if (target) {
+      target.lines.push(L);
+      target.vLast = L.v;
+      target.u0 = Math.min(target.u0, L.u0);
+      target.u1 = Math.max(target.u1, L.u1);
+    } else {
+      blocks.push({ rot: L.rot, size: L.size, lead: L.size * LINE_H, vFirst: L.v, vLast: L.v, u0: L.u0, u1: L.u1, lines: [L] });
+    }
+  }
+  // Ancho de columna: el bloque más ancho que empieza en el mismo margen izquierdo. Sirve para
+  // reconocer saltos de línea intencionales y como ancho disponible al reescribir bloques de líneas cortas.
+  const colWidth = (B) => Math.max(...blocks
+    .filter((o) => Math.abs(o.rot - B.rot) < 1 && Math.abs(o.u0 - B.u0) < B.size * 2)
+    .map((o) => o.u1 - o.u0));
+  return blocks.map((B, id) => {
+    const colW = colWidth(B);
+    const width = colW;
+    measureCtx.font = `${B.size}px ${FONT_FAMILIES.helv}`;
+    let text = '';
+    B.lines.forEach((L, i) => {
+      if (i === 0) { text = L.text; return; }
+      const prev = B.lines[i - 1];
+      const firstWord = L.text.trim().split(/\s+/)[0];
+      // Si la primera palabra cabía en la línea anterior, el salto era intencional (firma, dirección, lista).
+      const fitted = prev.u1 - B.u0 + measureCtx.measureText(' ' + firstWord).width <= width * 0.97;
+      if (/[a-záéíóúñü]-$/i.test(text) && /^[a-záéíóúñü]/.test(L.text)) text = text.slice(0, -1) + L.text; // palabra cortada con guion
+      else if (fitted) text += '\n' + L.text;
+      else text += ' ' + L.text;
+    });
+    const parts = B.lines.flatMap((L) => L.parts);
+    const main = parts.reduce((m, r) => (r.text.length > m.text.length ? r : m), parts[0]);
+    const [x, y] = rotVec(B.u0, B.vFirst, B.rot);
+    return {
+      id, x, y, rot: B.rot, size: B.size, w: B.u1 - B.u0, colW, text, fontName: main.fontName,
+      asc: main.asc, desc: main.desc, nLines: B.lines.length, lead: B.lead,
+    };
+  });
+}
+
 function getRuns(p) {
   const key = runKeyOf(p);
   if (!runCache.has(key)) {
     runCache.set(key, (async () => {
       const proxy = await state.sources.get(p.src).doc.getPage(p.index + 1);
-      const runs = buildRuns(await proxy.getTextContent());
+      const runs = buildBlocks(buildRuns(await proxy.getTextContent()));
       runSync.set(key, runs);
       return runs;
     })().catch(() => { runSync.set(key, []); return []; }));
@@ -524,7 +614,8 @@ function getRuns(p) {
 }
 
 function runLocalBox(r, pad = 0) {
-  return { x0: -pad, x1: r.w + pad, y0: r.desc * r.size - pad, y1: r.asc * r.size + pad };
+  const bottom = -((r.nLines || 1) - 1) * (r.lead || 0);
+  return { x0: -pad, x1: r.w + pad, y0: bottom + r.desc * r.size - pad, y1: r.asc * r.size + pad };
 }
 function runCorners(r, pad = 0) {
   const b = runLocalBox(r, pad);
@@ -549,7 +640,7 @@ function drawRunOutlines(ctx, v) {
   ctx.strokeStyle = 'rgba(31,79,209,.6)';
   ctx.fillStyle = 'rgba(31,79,209,.07)';
   for (const r of runs) {
-    if (done.has(runKeyOf(v.page) + '#' + r.id)) continue;
+    if (done.has(blockKey(v.page, r))) continue;
     const c = runCorners(r, 0.6);
     ctx.beginPath();
     c.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
@@ -625,8 +716,8 @@ function editTextAt(v, pt) {
       return;
     }
     const r = runs.find((x) => hitRun(x, pt, 2 / v.scale + 0.5));
-    if (!r) { toast('Toca justo encima de una de las líneas marcadas en azul.'); return; }
-    const key = runKeyOf(v.page) + '#' + r.id;
+    if (!r) { toast('Toca justo encima de uno de los párrafos marcados en azul.'); return; }
+    const key = blockKey(v.page, r);
     const existing = v.page.annots.find((a) => a.runKey === key);
     if (existing) openTextDialog(existing, v);
     else openTextDialog(null, v, pt, r);
@@ -635,17 +726,45 @@ function editTextAt(v, pt) {
   if (ready) proceed(ready); else getRuns(v.page).then(proceed);
 }
 
+function freeSpaceBelow(v, r) {
+  const [, vTop] = toFrame(r.x, r.y, r.rot);
+  const bottom = vTop + runLocalBox(r).y0;
+  let limit = Infinity;
+  for (const o of runSync.get(runKeyOf(v.page)) || []) {
+    if (o === r || Math.abs(o.rot - r.rot) >= 1) continue;
+    const [ou, ov] = toFrame(o.x, o.y, o.rot);
+    const [ru] = toFrame(r.x, r.y, r.rot);
+    if (ou >= ru + r.w || ou + o.w <= ru) continue; // otra columna
+    const oTop = ov + o.asc * o.size;
+    if (oTop < bottom + 0.5) limit = Math.min(limit, bottom - oTop);
+  }
+  if (limit === Infinity) { // nada debajo: hasta el margen inferior de la página
+    const pageV = [[0, 1], [2, 1], [0, 3], [2, 3]].map(([i, j]) => toFrame(v.page.view[i], v.page.view[j], r.rot)[1]);
+    limit = bottom - (Math.min(...pageV) + 36);
+  }
+  return Math.max(0, limit - r.size * 0.4); // deja un pequeño respiro
+}
+
 async function replaceRun(v, r, text, size) {
   const { fg, bg } = sampleRunColors(v, r);
   const { font, bold, italic } = await runFont(v.page, r);
   const b = runLocalBox(r, 0.6);
-  const [cx, cy] = rotVec(b.x0, b.y0, r.rot);
+  const scale = size / r.size;
   const a = {
     id: newId('a'), type: 'text', x: r.x, y: r.y, rot: r.rot, size, text, color: fg, font, bold, italic,
-    cover: { x: r.x + cx, y: r.y + cy, rot: r.rot, w: b.x1 - b.x0, h: b.y1 - b.y0, color: bg },
-    runKey: runKeyOf(v.page) + '#' + r.id,
+    boxW: r.colW || r.w, lh: r.lead * scale, coverColor: bg,
+    coverBase: { ox: r.x, oy: r.y, ...b },
+    runKey: blockKey(v.page, r),
   };
-  a.w = measureText(a);
+  layoutText(a);
+  // Espacio disponible: el alto del párrafo original más el hueco libre hasta el siguiente bloque de abajo.
+  // Solo si el texto nuevo no cabe ahí se reduce la letra (hasta un 80 %), para no montarse encima.
+  const room = b.y1 - b.y0 + freeSpaceBelow(v, r);
+  const minSize = size * 0.8;
+  while (textHeight(a) > room + 0.5 && a.size > minSize) {
+    a.lh *= 0.96; a.size *= 0.96;
+    layoutText(a);
+  }
   pushUndo();
   v.page.annots.push(a);
   drawInk(v);
@@ -681,9 +800,60 @@ const FONT_FAMILIES = {
   courier: '"Courier New", Courier, monospace',
 };
 const fontCss = (a) => `${a.italic ? 'italic ' : ''}${a.bold ? 'bold ' : ''}${a.size}px ${FONT_FAMILIES[a.font || 'helv']}`;
+const textLines = (a) => a.lines || a.text.split('\n');
+const lineHeight = (a) => a.lh || a.size * LINE_H;
+const textHeight = (a) => (textLines(a).length - 1) * lineHeight(a) + a.size * 1.05;
 function measureText(a) {
   measureCtx.font = fontCss(a);
-  return Math.max(4, ...a.text.split('\n').map((l) => measureCtx.measureText(l).width));
+  return Math.max(4, ...textLines(a).map((l) => measureCtx.measureText(l).width));
+}
+
+// Reparte el texto en líneas que caben en boxW (ancho del cuadro de texto), como un procesador de textos.
+function wrapLines(a) {
+  if (!a.boxW) return a.text.split('\n');
+  measureCtx.font = fontCss(a);
+  const fits = (s) => measureCtx.measureText(s).width <= a.boxW;
+  const out = [];
+  for (const para of a.text.split('\n')) {
+    let line = '';
+    for (const word of para.split(' ')) {
+      const cand = line ? line + ' ' + word : word;
+      if (fits(cand)) { line = cand; continue; }
+      if (line) out.push(line);
+      line = word;
+      while (!fits(line) && line.length > 1) { // palabra más larga que el cuadro: se corta
+        let n = line.length - 1;
+        while (n > 1 && !fits(line.slice(0, n))) n--;
+        out.push(line.slice(0, n));
+        line = line.slice(n);
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+// Recalcula líneas, ancho y el recuadro que tapa lo de debajo (párrafo original o fondo elegido).
+function layoutText(a) {
+  a.lines = wrapLines(a);
+  a.w = measureText(a);
+  if (!a.coverBase && !a.bg) { delete a.cover; return; }
+  const pad = 0.6;
+  let x0 = -pad, x1 = Math.max(a.w, a.boxW || 0) + pad;
+  let y0 = -(a.lines.length - 1) * lineHeight(a) - a.size * 0.25 - pad, y1 = a.size * 0.85 + pad;
+  let ox = a.x, oy = a.y;
+  if (a.coverBase) {
+    const cb = a.coverBase;
+    const [du, dv] = toFrame(a.x - cb.ox, a.y - cb.oy, a.rot);
+    if (Math.hypot(du, dv) < 0.5) { // en su sitio: tapa el párrafo original y todo el texto nuevo
+      x0 = Math.min(x0, cb.x0); x1 = Math.max(x1, cb.x1); y0 = Math.min(y0, cb.y0); y1 = Math.max(y1, cb.y1);
+    } else { // movido: el párrafo original sigue tapado donde estaba
+      ({ x0, x1, y0, y1 } = cb);
+    }
+    ox = cb.ox; oy = cb.oy;
+  }
+  const [cx, cy] = rotVec(x0, y0, a.rot);
+  a.cover = { x: ox + cx, y: oy + cy, rot: a.rot, w: x1 - x0, h: y1 - y0, color: a.coverColor || a.bg };
 }
 function drawCover(ctx, c) {
   ctx.save();
@@ -723,7 +893,7 @@ function drawAnnot(ctx, a, redraw) {
     ctx.fillStyle = a.color;
     ctx.font = fontCss(a);
     ctx.textBaseline = 'alphabetic';
-    a.text.split('\n').forEach((l, i) => ctx.fillText(l, 0, i * a.size * LINE_H));
+    textLines(a).forEach((l, i) => ctx.fillText(l, 0, i * lineHeight(a)));
   } else if (a.type === 'image') {
     const img = getImg(a.src, redraw);
     if (img) {
@@ -745,9 +915,9 @@ function annotCorners(a) {
   if (a.type === 'rect') return [[a.x, a.y], [a.x + a.w, a.y], [a.x + a.w, a.y + a.h], [a.x, a.y + a.h]];
   let lx0 = 0, lx1, ly0, ly1;
   if (a.type === 'text') {
-    const n = a.text.split('\n').length;
+    const n = textLines(a).length;
     lx1 = a.w ?? measureText(a);
-    ly0 = -(n - 1) * a.size * LINE_H - a.size * 0.25;
+    ly0 = -(n - 1) * lineHeight(a) - a.size * 0.25;
     ly1 = a.size * 0.8;
   } else { lx1 = a.w; ly0 = 0; ly1 = a.h; }
   return [[lx0, ly0], [lx1, ly0], [lx1, ly1], [lx0, ly1]].map(([x, y]) => {
@@ -808,6 +978,7 @@ function hitTest(v, pt) {
 function moveAnnot(a, dx, dy) {
   if (a.type === 'path') a.pts = a.pts.map(([x, y]) => [x + dx, y + dy]);
   else { a.x += dx; a.y += dy; }
+  if (a.type === 'text' && a.cover) layoutText(a); // el fondo acompaña al texto
 }
 
 function bindPointer(v) {
@@ -950,7 +1121,12 @@ function updateSelbar() {
   if (s) $('#sel-edit').hidden = s.a.type !== 'text';
 }
 function scaleAnnot(a, f) {
-  if (a.type === 'text') { a.size = Math.max(4, Math.min(120, a.size * f)); a.w = measureText(a); }
+  if (a.type === 'text') {
+    const ns = Math.max(4, Math.min(120, a.size * f));
+    if (a.lh) a.lh *= ns / a.size;
+    a.size = ns;
+    layoutText(a);
+  }
   else if (a.type === 'image') {
     const nw = a.w * f;
     if (nw < 8 || nw > 2000) return;
@@ -1022,7 +1198,7 @@ $('#toolbar').addEventListener('click', (e) => {
   const t = b.dataset.tool;
   setTool(t);
   if (t === 'text') toast('Toca la página donde quieres escribir.');
-  if (t === 'edittext') { prefetchRuns(); toast('Toca una línea marcada en azul para cambiar su texto.'); }
+  if (t === 'edittext') { prefetchRuns(); toast('Toca un párrafo marcado en azul para cambiar su texto.'); }
   if (t === 'sign') openSignDialog();
   if (t === 'image') $('#file-img').click();
   if (t === 'rect') toast('Arrastra sobre la zona que quieres tapar.');
@@ -1034,11 +1210,13 @@ $('#toolbar').addEventListener('click', (e) => {
 let textCtx = null;
 // run: línea de texto original del PDF que se va a reemplazar (herramienta «Editar»).
 function openTextDialog(annot, v, pt, run = null) {
-  const replacing = !!(run || annot?.cover);
+  const replacing = !!(run || annot?.coverBase);
   const d = $('#dlg-text');
   $('#text-title').textContent = replacing ? 'Cambiar texto del PDF' : 'Texto';
   $('#text-ok').textContent = annot || run ? 'Cambiar' : 'Colocar';
   $('#text-hint').hidden = !replacing;
+  $('#text-bg-row').hidden = replacing;
+  $('#text-bg').checked = annot ? !!annot.bg : !!prefs.text.bg;
   $('#text-input').value = annot ? annot.text : run ? run.text : '';
   const exact = annot ? annot.size : run ? run.size : prefs.text.size;
   const slider = $('#text-size');
@@ -1057,7 +1235,7 @@ $('#dlg-text').addEventListener('close', () => {
   const { annot, v, pt, run, exact, sliderStart } = textCtx || {};
   textCtx = null;
   const text = $('#text-input').value.replace(/\s+$/, '');
-  const replacing = !!(run || annot?.cover);
+  const replacing = !!(run || annot?.coverBase);
   if (d.returnValue !== 'ok' || !v || (!text && !replacing)) return;
   // si no se tocó el tamaño se conserva el original exacto (p. ej. 9,96 pt)
   const size = $('#text-size').value === sliderStart ? exact : +$('#text-size').value;
@@ -1065,17 +1243,26 @@ $('#dlg-text').addEventListener('close', () => {
     if (text !== run.text || size !== exact) replaceRun(v, run, text, size);
     return;
   }
-  if (!replacing) prefs.text.size = size;
+  const bg = !replacing && $('#text-bg').checked ? '#ffffff' : null;
+  if (!replacing) { prefs.text.size = size; prefs.text.bg = !!bg; }
   pushUndo();
   if (annot) {
-    annot.text = text; annot.size = size; annot.w = measureText(annot);
+    if (annot.lh) annot.lh *= size / annot.size;
+    annot.text = text; annot.size = size;
+    if (!replacing) annot.bg = bg;
+    layoutText(annot);
     redrawAll();
     saveMeta();
   } else {
     const rot = pageRotation(v.page);
     const [ax, ay] = rotVec(0, size * 0.8, rot);
-    const a = { id: newId('a'), type: 'text', x: pt[0] - ax, y: pt[1] - ay, text, size, color: prefs.text.color, rot };
-    a.w = measureText(a);
+    const x = pt[0] - ax, y = pt[1] - ay;
+    // ancho del cuadro: desde donde se tocó hasta el margen derecho de la página
+    const [u] = toFrame(x, y, rot);
+    const pageU = [[0, 1], [2, 1], [0, 3], [2, 3]].map(([i, j]) => toFrame(v.page.view[i], v.page.view[j], rot)[0]);
+    const boxW = Math.max(60, Math.max(...pageU) - 24 - u);
+    const a = { id: newId('a'), type: 'text', x, y, text, size, color: prefs.text.color, rot, boxW, bg };
+    layoutText(a);
     v.page.annots.push(a);
     selectAfterCreate(v, a);
   }
@@ -1702,8 +1889,8 @@ async function buildPdf() {
           pg.drawRectangle({ x: c.x + offX, y: c.y + offY, width: c.w, height: c.h, rotate: degrees(c.rot), color: hexToRgb(c.color) });
         }
         const font = await fontFor(a);
-        const lh = a.size * LINE_H;
-        a.text.split('\n').forEach((line, i) => {
+        const lh = lineHeight(a);
+        textLines(a).forEach((line, i) => {
           if (!line) return;
           const [dx, dy] = rotVec(0, -i * lh, a.rot);
           pg.drawText(winAnsiSafe(font, line), {
@@ -1810,6 +1997,18 @@ window.addEventListener('unhandledrejection', (e) => console.error(e.reason));
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Cuando se instala una versión nueva, se recarga sola en la pantalla de inicio (no se pierde trabajo:
+  // la sesión ya está guardada); si estás editando, se aplica al volver al inicio.
+  const hadController = !!navigator.serviceWorker.controller;
+  let updateReady = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController) return; // primera instalación, no es una actualización
+    updateReady = true;
+    if (!$('#welcome').hidden) location.reload();
+    else toast('Hay una versión nueva. Se aplicará al volver a la pantalla de inicio.', 4000);
+  });
+  // espera a que termine el guardado de la sesión (saveMeta tarda hasta 0,7 s)
+  $('#btn-home').addEventListener('click', () => { if (updateReady) setTimeout(() => location.reload(), 1200); });
 }
 
 showWelcome();

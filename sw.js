@@ -1,6 +1,6 @@
 // Guarda la app en el iPhone para que funcione sin conexión.
 // Al cambiar cualquier archivo de la app, sube VERSION para que los teléfonos descarguen la nueva.
-const VERSION = 'v3';
+const VERSION = 'v4';
 const CACHE = 'pdf-editor-' + VERSION;
 const CORE = [
   './',
