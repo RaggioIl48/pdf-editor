@@ -59,6 +59,8 @@
 
   <!-- Barra de selección -->
   <div id="selbar" hidden>
+    <button data-sel="narrower" id="sel-narrower" aria-label="Cuadro más estrecho">⇥⇤</button>
+    <button data-sel="wider" id="sel-wider" aria-label="Cuadro más ancho">⇤⇥</button>
     <button data-sel="smaller">A−</button>
     <button data-sel="bigger">A+</button>
     <button data-sel="edit" id="sel-edit">Editar</button>
@@ -194,6 +196,10 @@
   <dialog id="dlg-export" class="sheet">
     <h2>PDF listo</h2>
     <p class="muted" id="export-info"></p>
+    <label class="row redact" id="redact-row" hidden>
+      <input type="checkbox" id="redact">
+      <span><b>Borrar de verdad el texto tapado.</b> Las páginas donde cambiaste o tapaste texto se guardan como imagen: el texto anterior desaparece del archivo (no se puede copiar ni buscar).</span>
+    </label>
     <div class="sheet-actions col">
       <button class="btn primary" id="export-share">Compartir / Guardar en Archivos</button>
       <a class="btn" id="export-download" download>Abrir / Descargar</a>

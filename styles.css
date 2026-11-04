@@ -81,8 +81,7 @@ body.is-welcome #btn-home, body.is-welcome #btn-undo, body.is-welcome #btn-redo,
 #install-hint { margin-top: 20px; }
 
 /* Visor */
-#viewer { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; position: relative; }
-#pages { width: max-content; min-width: 100%; padding: 16px; }
+#viewer { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; position: relative; touch-action: pan-x pan-y; }#pages { width: max-content; min-width: 100%; padding: 16px; }
 .page {
   position: relative; margin: 0 auto 16px; background: #fff; box-shadow: var(--shadow);
 }
@@ -107,7 +106,8 @@ body.tool-active .page .ink { pointer-events: auto; touch-action: none; }
 #selbar {
   position: fixed; left: 50%; transform: translateX(-50%);
   bottom: calc(var(--safe-bottom) + 132px); z-index: 6;
-  display: flex; gap: 4px; padding: 6px; border-radius: 14px;
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; padding: 6px; border-radius: 14px;
+  width: max-content; max-width: calc(100vw - 24px);
   background: var(--surface); box-shadow: var(--shadow); border: 1px solid var(--line);
 }
 #selbar button { border: 0; background: var(--surface-2); padding: 8px 12px; border-radius: 9px; font-size: 14px; font-weight: 600; }
@@ -160,6 +160,8 @@ dialog h2 { margin: 0 0 12px; font-size: 18px; }
 .btn.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; }
 .row { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 14px; }
 .row input[type=range] { flex: 1; }
+.row.redact { align-items: flex-start; background: var(--surface-2); border-radius: 12px; padding: 10px; }
+.row.redact input { width: 22px; height: 22px; flex: none; margin-top: 1px; }
 textarea, input[type=text], select {
   width: 100%; font: inherit; font-size: 16px; color: var(--text); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 10px; padding: 10px; -webkit-user-select: text; user-select: text;

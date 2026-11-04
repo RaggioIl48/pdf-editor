@@ -571,31 +571,30 @@ function buildBlocks(runs) {
     }
   }
   // Ancho de columna: el bloque más ancho que empieza en el mismo margen izquierdo. Sirve para
-  // reconocer saltos de línea intencionales y como ancho disponible al reescribir bloques de líneas cortas.
-  const colWidth = (B) => Math.max(...blocks
-    .filter((o) => Math.abs(o.rot - B.rot) < 1 && Math.abs(o.u0 - B.u0) < B.size * 2)
-    .map((o) => o.u1 - o.u0));
   return blocks.map((B, id) => {
-    const colW = colWidth(B);
-    const width = colW;
+    // El ancho del párrafo es el de su línea más larga: es el ancho fijo del cuadro al reescribirlo.
+    const width = B.u1 - B.u0;
     measureCtx.font = `${B.size}px ${FONT_FAMILIES.helv}`;
     let text = '';
     B.lines.forEach((L, i) => {
       if (i === 0) { text = L.text; return; }
       const prev = B.lines[i - 1];
       const firstWord = L.text.trim().split(/\s+/)[0];
-      // Si la primera palabra cabía en la línea anterior, el salto era intencional (firma, dirección, lista).
+      // Salto intencional (firma, dirección, lista) si la primera palabra cabía en la línea anterior,
+      // si la anterior acaba en «,» o «:» y la siguiente empieza en mayúscula, o si empieza una viñeta.
       const fitted = prev.u1 - B.u0 + measureCtx.measureText(' ' + firstWord).width <= width * 0.97;
+      const hard = fitted || (/[,:]$/.test(prev.text) && /^[A-ZÁÉÍÓÚÑ]/.test(L.text)) || /^([•\-–*]|\d+[.)])\s/.test(L.text);
       if (/[a-záéíóúñü]-$/i.test(text) && /^[a-záéíóúñü]/.test(L.text)) text = text.slice(0, -1) + L.text; // palabra cortada con guion
-      else if (fitted) text += '\n' + L.text;
+      else if (hard) text += '\n' + L.text;
       else text += ' ' + L.text;
     });
     const parts = B.lines.flatMap((L) => L.parts);
     const main = parts.reduce((m, r) => (r.text.length > m.text.length ? r : m), parts[0]);
     const [x, y] = rotVec(B.u0, B.vFirst, B.rot);
     return {
-      id, x, y, rot: B.rot, size: B.size, w: B.u1 - B.u0, colW, text, fontName: main.fontName,
+      id, x, y, rot: B.rot, size: B.size, w: width, text, fontName: main.fontName,
       asc: main.asc, desc: main.desc, nLines: B.lines.length, lead: B.lead,
+      lineTexts: B.lines.map((L) => L.text), // cortes de línea originales, para desplazarlo sin cambiarlo
     };
   });
 }
@@ -726,47 +725,130 @@ function editTextAt(v, pt) {
   if (ready) proceed(ready); else getRuns(v.page).then(proceed);
 }
 
+/* Reflujo: el ancho de cada párrafo es fijo, el texto que sobra baja como en un procesador de textos.
+   Si ya no cabe en el hueco de abajo, los párrafos de la misma columna se desplazan hacia abajo.
+   Cada párrafo editado guarda cuánto empuja (a.push); el desplazamiento de un párrafo es la suma de
+   los empujes de los párrafos editados que tiene encima, así que se puede recalcular siempre. */
+
+// Extensión de un bloque en el marco del texto (u hacia la derecha, v hacia arriba).
+function blockSpan(o) {
+  const [u, vv] = toFrame(o.x, o.y, o.rot);
+  const b = runLocalBox(o);
+  return { u0: u, u1: u + o.w, top: vv + b.y1, bottom: vv + b.y0 };
+}
+function isBelow(o, r) {
+  if (o === r || Math.abs(o.rot - r.rot) >= 1) return false;
+  const s = blockSpan(r), t = blockSpan(o);
+  return t.u0 < s.u1 && t.u1 > s.u0 && t.top < s.bottom + 0.5; // misma columna y más abajo
+}
+function pageBottomV(page, rot) {
+  const vs = [[0, 1], [2, 1], [0, 3], [2, 3]].map(([i, j]) => toFrame(page.view[i], page.view[j], rot)[1]);
+  return Math.min(...vs) + 36; // margen inferior
+}
+
 function freeSpaceBelow(v, r) {
-  const [, vTop] = toFrame(r.x, r.y, r.rot);
-  const bottom = vTop + runLocalBox(r).y0;
+  const bottom = blockSpan(r).bottom;
   let limit = Infinity;
   for (const o of runSync.get(runKeyOf(v.page)) || []) {
-    if (o === r || Math.abs(o.rot - r.rot) >= 1) continue;
-    const [ou, ov] = toFrame(o.x, o.y, o.rot);
-    const [ru] = toFrame(r.x, r.y, r.rot);
-    if (ou >= ru + r.w || ou + o.w <= ru) continue; // otra columna
-    const oTop = ov + o.asc * o.size;
-    if (oTop < bottom + 0.5) limit = Math.min(limit, bottom - oTop);
+    if (isBelow(o, r)) limit = Math.min(limit, bottom - blockSpan(o).top);
   }
-  if (limit === Infinity) { // nada debajo: hasta el margen inferior de la página
-    const pageV = [[0, 1], [2, 1], [0, 3], [2, 3]].map(([i, j]) => toFrame(v.page.view[i], v.page.view[j], r.rot)[1]);
-    limit = bottom - (Math.min(...pageV) + 36);
-  }
+  if (limit === Infinity) limit = bottom - pageBottomV(v.page, r.rot); // nada debajo: hasta el margen
   return Math.max(0, limit - r.size * 0.4); // deja un pequeño respiro
 }
 
-async function replaceRun(v, r, text, size) {
+// Suma de los empujes de los párrafos editados que hay encima de `o` (sin contar `skip`).
+function dispFor(page, runs, o, skip) {
+  let d = 0;
+  for (const c of page.annots) {
+    if (c === skip || !c.push || !c.runKey) continue;
+    const p = runs.find((x) => blockKey(page, x) === c.runKey);
+    if (p && isBelow(o, p)) d += c.push;
+  }
+  return d;
+}
+
+async function makeBlockAnnot(v, r, text, size) {
   const { fg, bg } = sampleRunColors(v, r);
   const { font, bold, italic } = await runFont(v.page, r);
-  const b = runLocalBox(r, 0.6);
   const scale = size / r.size;
   const a = {
-    id: newId('a'), type: 'text', x: r.x, y: r.y, rot: r.rot, size, text, color: fg, font, bold, italic,
-    boxW: r.colW || r.w, lh: r.lead * scale, coverColor: bg,
-    coverBase: { ox: r.x, oy: r.y, ...b },
+    id: newId('a'), type: 'text', x: r.x, y: r.y, rot: r.rot, size, baseSize: size, text, color: fg, font, bold, italic,
+    // +3 %: la letra de la pantalla mide un poco distinto que la del PDF; sin margen saltaría una palabra
+    boxW: r.w * 1.03, lh: r.lead * scale, coverColor: bg, desc: r.desc,
+    coverBase: (() => { // un poco más alto que la letra: algunas (p, g, j) bajan más que el valor declarado
+      const b = runLocalBox(r, 0.6);
+      return { ox: r.x, oy: r.y, ...b, y0: b.y0 - r.size * 0.12, y1: b.y1 + r.size * 0.05 };
+    })(),
     runKey: blockKey(v.page, r),
   };
   layoutText(a);
-  // Espacio disponible: el alto del párrafo original más el hueco libre hasta el siguiente bloque de abajo.
-  // Solo si el texto nuevo no cabe ahí se reduce la letra (hasta un 80 %), para no montarse encima.
-  const room = b.y1 - b.y0 + freeSpaceBelow(v, r);
-  const minSize = size * 0.8;
-  while (textHeight(a) > room + 0.5 && a.size > minSize) {
+  return a;
+}
+
+// Coloca cada párrafo según la suma de empujes de encima: crea, mueve o retira las copias desplazadas.
+async function applyPushes(v, runs) {
+  const page = v.page;
+  for (const o of runs) {
+    const key = blockKey(page, o);
+    const disp = dispFor(page, runs, o, null);
+    let ann = page.annots.find((x) => x.runKey === key);
+    if (Math.abs(disp) > 0.05) {
+      if (!ann) {
+        ann = await makeBlockAnnot(v, o, o.text, o.size);
+        ann.autoPush = true; // copia idéntica del original, solo desplazada
+        ann.fixedLines = o.lineTexts; // con sus mismos cortes de línea
+        page.annots.push(ann);
+      }
+      const [dx, dy] = rotVec(0, -disp, o.rot);
+      ann.x = o.x + dx; ann.y = o.y + dy; ann.disp = disp;
+      layoutText(ann);
+    } else if (ann && ann.disp) {
+      if (ann.autoPush) page.annots = page.annots.filter((x) => x !== ann);
+      else { ann.x = o.x; ann.y = o.y; ann.disp = 0; layoutText(ann); }
+    }
+  }
+}
+
+// Calcula cuánto empuja un párrafo editado. Si los de abajo ya no caben en la página, reduce la letra
+// (hasta un 80 %) y, como último recurso, deja de empujar.
+async function settleBlock(v, a, allowShrink) {
+  const runs = runSync.get(runKeyOf(v.page)) || await getRuns(v.page);
+  const r = runs.find((o) => blockKey(v.page, o) === a.runKey);
+  if (!r) return;
+  const span = blockSpan(r);
+  const below = runs.filter((o) => isBelow(o, r));
+  // Con párrafos debajo se conserva el espacio entre párrafos (mismo formato): todo lo que crezca empuja.
+  // Sin nada debajo, puede crecer libremente hasta el margen inferior.
+  const avail = below.length ? span.bottom : span.bottom - freeSpaceBelow(v, r);
+  // Positivo: los de abajo bajan. Negativo (texto más corto): suben y no queda un hueco.
+  const needed = () => {
+    const newBottom = toFrame(r.x, r.y, r.rot)[1] - (textLines(a).length - 1) * lineHeight(a) + (a.desc ?? -0.2) * a.size;
+    return below.length ? avail - newBottom : Math.max(0, avail - newBottom);
+  };
+  let room = 0; // cuánto se pueden bajar los párrafos de abajo sin salirse de la página
+  if (below.length) {
+    const lowest = Math.min(...below.map((o) => blockSpan(o).bottom - dispFor(v.page, runs, o, a)));
+    room = Math.max(0, lowest - pageBottomV(v.page, r.rot));
+  }
+  let push = needed();
+  const minSize = (a.baseSize || a.size) * 0.8;
+  let shrank = false;
+  while (allowShrink && push > room + 0.1 && a.size > minSize) {
     a.lh *= 0.96; a.size *= 0.96;
     layoutText(a);
+    push = needed();
+    shrank = true;
   }
+  a.push = push > 0 ? Math.min(push, room) : push;
+  await applyPushes(v, runs);
+  if (shrank) toast('No cabía en la página: se redujo un poco la letra.');
+}
+
+async function replaceRun(v, r, text, size) {
+  const a = await makeBlockAnnot(v, r, text, size);
   pushUndo();
   v.page.annots.push(a);
+  await settleBlock(v, a, true);
   drawInk(v);
   saveMeta();
 }
@@ -835,7 +917,7 @@ function wrapLines(a) {
 
 // Recalcula líneas, ancho y el recuadro que tapa lo de debajo (párrafo original o fondo elegido).
 function layoutText(a) {
-  a.lines = wrapLines(a);
+  a.lines = a.fixedLines || wrapLines(a);
   a.w = measureText(a);
   if (!a.coverBase && !a.bg) { delete a.cover; return; }
   const pad = 0.6;
@@ -886,8 +968,7 @@ function drawAnnot(ctx, a, redraw) {
       ctx.strokeRect(a.x, a.y, a.w, a.h);
     }
   } else if (a.type === 'text') {
-    if (a.cover) drawCover(ctx, a.cover); // texto original reemplazado: se tapa con el color del fondo
-    ctx.translate(a.x, a.y);
+    ctx.translate(a.x, a.y); // su recuadro (a.cover) se pinta antes, en drawInk, debajo de todos los textos
     ctx.rotate((a.rot * Math.PI) / 180);
     ctx.scale(1, -1);
     ctx.fillStyle = a.color;
@@ -916,7 +997,7 @@ function annotCorners(a) {
   let lx0 = 0, lx1, ly0, ly1;
   if (a.type === 'text') {
     const n = textLines(a).length;
-    lx1 = a.w ?? measureText(a);
+    lx1 = Math.max(a.w ?? measureText(a), a.boxW || 0); // el marco muestra el ancho fijo del cuadro
     ly0 = -(n - 1) * lineHeight(a) - a.size * 0.25;
     ly1 = a.size * 0.8;
   } else { lx1 = a.w; ly0 = 0; ly1 = a.h; }
@@ -942,6 +1023,9 @@ function drawInk(v) {
   const m = v.vp.transform;
   ctx.setTransform(m[0] * k, m[1] * k, m[2] * k, m[3] * k, m[4] * k, m[5] * k);
   const redraw = () => drawInk(v);
+  // Primero todos los recuadros que tapan el texto original; así un párrafo desplazado
+  // nunca queda escondido bajo el recuadro de otro.
+  for (const a of v.page.annots) if (a.type === 'text' && a.cover) drawCover(ctx, a.cover);
   for (const a of v.page.annots) drawAnnot(ctx, a, redraw);
   if (tempAnnot && tempAnnot.pageId === v.page.id) drawAnnot(ctx, tempAnnot.annot, redraw);
   if (state.tool === 'edittext') drawRunOutlines(ctx, v);
@@ -1014,7 +1098,15 @@ function bindPointer(v) {
     }
   });
 
+  const abortForPinch = () => { // el segundo dedo convierte el gesto en zoom: se descarta lo que se estaba dibujando
+    if (!g) return;
+    if (g.kind === 'move' && g.moved) { state.pages = JSON.parse(g.snap); layout(); }
+    g = null;
+    tempAnnot = null;
+    drawInk(v);
+  };
   v.ink.addEventListener('pointermove', (e) => {
+    if (pinch.active) { abortForPinch(); return; }
     if (!g || e.pointerId !== g.id) return;
     if (Math.hypot(e.clientX - g.sx, e.clientY - g.sy) > 8) g.moved = true;
     if (g.kind === 'pan') {
@@ -1040,6 +1132,7 @@ function bindPointer(v) {
   });
 
   const end = (e) => {
+    if (pinch.active) { abortForPinch(); return; }
     if (!g || e.pointerId !== g.id) return;
     const cancelled = e.type === 'pointercancel';
     const pt = g.last;
@@ -1118,7 +1211,10 @@ function selectedAnnot() {
 function updateSelbar() {
   const s = state.tool === 'select' ? selectedAnnot() : null;
   $('#selbar').hidden = !s;
-  if (s) $('#sel-edit').hidden = s.a.type !== 'text';
+  if (s) {
+    const isText = s.a.type === 'text';
+    for (const id of ['#sel-edit', '#sel-wider', '#sel-narrower']) $(id).hidden = !isText;
+  }
 }
 function scaleAnnot(a, f) {
   if (a.type === 'text') {
@@ -1145,11 +1241,28 @@ $('#selbar').addEventListener('click', (e) => {
   if (!act || !s) return;
   if (act === 'edit') { openTextDialog(s.a, views.get(s.p.id)); return; }
   pushUndo();
-  if (act === 'delete') { s.p.annots = s.p.annots.filter((x) => x !== s.a); state.selected = null; }
-  else scaleAnnot(s.a, act === 'bigger' ? 1.15 : 1 / 1.15);
-  redrawAll();
-  updateSelbar();
-  saveMeta();
+  const v = views.get(s.p.id);
+  let settle = null;
+  if (act === 'delete') {
+    s.p.annots = s.p.annots.filter((x) => x !== s.a);
+    state.selected = null;
+    // si era un párrafo que empujaba a otros, vuelven a su sitio
+    if (s.a.push) settle = getRuns(s.p).then((runs) => applyPushes(v, runs));
+  } else if (act === 'wider' || act === 'narrower') {
+    const a = s.a;
+    a.boxW = Math.max(40, (a.boxW || a.w) * (act === 'wider' ? 1.15 : 1 / 1.15));
+    delete a.fixedLines;
+    layoutText(a);
+    if (a.runKey) settle = settleBlock(v, a, false);
+  } else {
+    scaleAnnot(s.a, act === 'bigger' ? 1.15 : 1 / 1.15);
+    if (s.a.type === 'text' && s.a.runKey) settle = settleBlock(v, s.a, false);
+  }
+  Promise.resolve(settle).then(() => {
+    redrawAll();
+    updateSelbar();
+    saveMeta();
+  });
 });
 
 /* ---------------- Herramientas ---------------- */
@@ -1248,11 +1361,14 @@ $('#dlg-text').addEventListener('close', () => {
   pushUndo();
   if (annot) {
     if (annot.lh) annot.lh *= size / annot.size;
+    if (size !== annot.size) annot.baseSize = size;
     annot.text = text; annot.size = size;
+    annot.autoPush = false; // ya es un párrafo editado por ti, no una copia desplazada
+    delete annot.fixedLines;
     if (!replacing) annot.bg = bg;
     layoutText(annot);
-    redrawAll();
-    saveMeta();
+    const done = () => { redrawAll(); saveMeta(); };
+    if (annot.runKey) settleBlock(v, annot, true).then(done); else done();
   } else {
     const rot = pageRotation(v.page);
     const [ax, ay] = rotVec(0, size * 0.8, rot);
@@ -1800,11 +1916,15 @@ function winAnsiSafe(font, text) {
   return out;
 }
 
-async function rasterPage(out, src, p) {
-  // Solo para PDF cifrados que pdf-lib no puede copiar: la página se convierte en imagen.
+// Zonas que tapan contenido original: recuadros de texto reemplazado/con fondo y la herramienta «Tapar».
+const hasCovers = (p) => p.annots.some((a) => (a.type === 'text' && a.cover) || a.type === 'rect');
+
+// La página se convierte en imagen. Se usa para PDF cifrados que pdf-lib no puede copiar y para el
+// borrado real: con `burn` los recuadros se pintan dentro de la imagen, así el texto de debajo deja de existir.
+async function rasterPage(out, src, p, burn = false) {
   const proxy = await src.doc.getPage(p.index + 1);
   const w = p.view[2] - p.view[0], h = p.view[3] - p.view[1];
-  const s = Math.min(2.5, 2200 / Math.max(w, h));
+  const s = Math.min(burn ? 3 : 2.5, (burn ? 2600 : 2200) / Math.max(w, h));
   const vp = proxy.getViewport({ scale: s, rotation: 0 });
   const c = document.createElement('canvas');
   c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
@@ -1812,6 +1932,14 @@ async function rasterPage(out, src, p) {
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, c.width, c.height);
   await proxy.render({ canvasContext: ctx, viewport: vp }).promise;
+  if (burn) {
+    ctx.setTransform(...vp.transform);
+    for (const a of p.annots) {
+      if (a.type === 'text' && a.cover) drawCover(ctx, a.cover);
+      else if (a.type === 'rect') { ctx.fillStyle = a.color; ctx.fillRect(a.x, a.y, a.w, a.h); }
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
   const jpg = await out.embedJpg(dataUrlToBytes(c.toDataURL('image/jpeg', 0.9)));
   c.width = c.height = 0;
   const pg = out.addPage([w, h]);
@@ -1820,8 +1948,11 @@ async function rasterPage(out, src, p) {
   return { pg, offX: -p.view[0], offY: -p.view[1] };
 }
 
-async function buildPdf() {
+async function buildPdf({ redact = false } = {}) {
   const out = await PDFDocument.create();
+  // Con borrado real, las páginas con zonas tapadas no se copian del original (ni siquiera sin usar:
+  // pdf-lib guardaría sus objetos en el archivo y el texto seguiría ahí).
+  const burnIds = new Set(redact ? state.pages.filter(hasCovers).map((p) => p.id) : []);
   const STD = {
     helv: 'Helvetica', helvB: 'HelveticaBold', helvI: 'HelveticaOblique', helvBI: 'HelveticaBoldOblique',
     times: 'TimesRoman', timesB: 'TimesRomanBold', timesI: 'TimesRomanItalic', timesBI: 'TimesRomanBoldItalic',
@@ -1847,7 +1978,8 @@ async function buildPdf() {
   const copied = new Map();
   for (const [id, lib] of libs) {
     if (!lib) continue;
-    const mine = state.pages.filter((p) => p.src === id);
+    const mine = state.pages.filter((p) => p.src === id && !burnIds.has(p.id));
+    if (!mine.length) continue;
     const cps = await out.copyPages(lib, mine.map((p) => p.index));
     mine.forEach((p, i) => copied.set(p.id, cps[i]));
   }
@@ -1865,12 +1997,20 @@ async function buildPdf() {
     if (copied.has(p.id)) {
       pg = out.addPage(copied.get(p.id));
       pg.setRotation(degrees((((pg.getRotation().angle + p.rot) % 360) + 360) % 360));
+    } else if (burnIds.has(p.id)) {
+      ({ pg, offX, offY } = await rasterPage(out, state.sources.get(p.src), p, true));
     } else {
       ({ pg, offX, offY } = await rasterPage(out, state.sources.get(p.src), p));
       rastered++;
     }
     if (p.annots.some((a) => a.type === 'path') && PDFLib.setLineJoin && PDFLib.LineJoinStyle) {
       pg.pushOperators(PDFLib.setLineJoin(PDFLib.LineJoinStyle.Round));
+    }
+    // Igual que en pantalla: primero los recuadros, luego todo lo demás.
+    for (const a of p.annots) {
+      if (a.type !== 'text' || !a.cover) continue;
+      const c = a.cover;
+      pg.drawRectangle({ x: c.x + offX, y: c.y + offY, width: c.w, height: c.h, rotate: degrees(c.rot), color: hexToRgb(c.color) });
     }
     for (const a of p.annots) {
       if (a.type === 'path') {
@@ -1884,10 +2024,6 @@ async function buildPdf() {
       } else if (a.type === 'rect') {
         pg.drawRectangle({ x: a.x + offX, y: a.y + offY, width: a.w, height: a.h, color: hexToRgb(a.color) });
       } else if (a.type === 'text') {
-        if (a.cover) {
-          const c = a.cover;
-          pg.drawRectangle({ x: c.x + offX, y: c.y + offY, width: c.w, height: c.h, rotate: degrees(c.rot), color: hexToRgb(c.color) });
-        }
         const font = await fontFor(a);
         const lh = lineHeight(a);
         textLines(a).forEach((line, i) => {
@@ -1906,10 +2042,19 @@ async function buildPdf() {
 }
 
 let exported = null;
-$('#btn-save').addEventListener('click', async () => {
-  busy('Creando PDF…');
+$('#btn-save').addEventListener('click', () => {
+  const covered = state.pages.filter(hasCovers).length;
+  $('#redact-row').hidden = !covered;
+  $('#redact').checked = false;
+  exportPdf();
+});
+$('#redact').addEventListener('change', () => exportPdf());
+
+async function exportPdf() {
+  const redact = $('#redact').checked && !$('#redact-row').hidden;
+  busy(redact ? 'Borrando el texto tapado…' : 'Creando PDF…');
   try {
-    const { bytes, rastered } = await buildPdf();
+    const { bytes, rastered } = await buildPdf({ redact });
     const name = (state.name || 'documento') + '-editado.pdf';
     if (exported?.url) URL.revokeObjectURL(exported.url);
     const file = new File([bytes], name, { type: 'application/pdf' });
@@ -1921,14 +2066,14 @@ $('#btn-save').addEventListener('click', async () => {
     $('#export-info').textContent = `${name} · ${state.pages.length} pág. · ${kb > 1024 ? (kb / 1024).toFixed(1) + ' MB' : Math.round(kb) + ' KB'}` +
       (rastered ? ` · ${rastered} página(s) protegidas se guardaron como imagen.` : '');
     $('#export-share').hidden = !(navigator.canShare && navigator.canShare({ files: [file] }));
-    $('#dlg-export').showModal();
+    if (!$('#dlg-export').open) $('#dlg-export').showModal();
   } catch (e) {
     console.error(e);
     toast('No se pudo crear el PDF: ' + (e.message || e), 5000);
   } finally {
     busy(null);
   }
-});
+}
 $('#export-share').addEventListener('click', async () => {
   try {
     await navigator.share({ files: [exported.file], title: exported.file.name });
@@ -1981,6 +2126,50 @@ function setZoom(z) {
   layout();
   viewer.scrollTop = ry * viewer.scrollHeight;
 }
+/* Zoom con dos dedos: durante el gesto se escala con CSS (fluido); al soltar se vuelve a dibujar
+   a la nueva escala manteniendo bajo los dedos el mismo punto del documento. Funciona con cualquier herramienta. */
+const pinch = { active: false };
+const touchCenter = (t) => [(t[0].clientX + t[1].clientX) / 2, (t[0].clientY + t[1].clientY) / 2];
+const touchDist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+viewer.addEventListener('touchstart', (e) => {
+  if (e.touches.length !== 2) return;
+  e.preventDefault();
+  const r = viewer.getBoundingClientRect();
+  const [cx, cy] = touchCenter(e.touches);
+  Object.assign(pinch, {
+    active: true, d0: touchDist(e.touches), k: 1,
+    cx: cx - r.left, cy: cy - r.top, ncx: cx - r.left, ncy: cy - r.top,
+    fx: viewer.scrollLeft + cx - r.left, fy: viewer.scrollTop + cy - r.top,
+  });
+  pagesHost.style.transformOrigin = `${pinch.fx}px ${pinch.fy}px`;
+}, { passive: false });
+viewer.addEventListener('touchmove', (e) => {
+  if (!pinch.active || e.touches.length < 2) return;
+  e.preventDefault();
+  const r = viewer.getBoundingClientRect();
+  const [cx, cy] = touchCenter(e.touches);
+  pinch.k = Math.max(0.5 / state.zoom, Math.min(4 / state.zoom, touchDist(e.touches) / pinch.d0));
+  pinch.ncx = cx - r.left; pinch.ncy = cy - r.top;
+  pagesHost.style.transform = `translate(${pinch.ncx - pinch.cx}px, ${pinch.ncy - pinch.cy}px) scale(${pinch.k})`;
+}, { passive: false });
+const endPinch = (e) => {
+  if (!pinch.active || e.touches.length >= 2) return;
+  pinch.active = false;
+  pagesHost.style.transform = '';
+  const old = state.zoom;
+  const z = Math.max(0.5, Math.min(4, old * pinch.k));
+  if (Math.abs(z - old) < 0.01) return;
+  state.zoom = z;
+  layout();
+  const s = z / old;
+  viewer.scrollLeft = pinch.fx * s - pinch.ncx;
+  viewer.scrollTop = pinch.fy * s - pinch.ncy;
+};
+viewer.addEventListener('touchend', endPinch);
+viewer.addEventListener('touchcancel', endPinch);
+// Safari: que el gesto no amplíe toda la app (barras incluidas) en lugar del documento
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+
 $('#btn-zoom-in').addEventListener('click', () => setZoom(state.zoom * 1.25));
 $('#btn-zoom-out').addEventListener('click', () => setZoom(state.zoom / 1.25));
 
